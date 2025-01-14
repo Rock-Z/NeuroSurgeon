@@ -23,6 +23,10 @@ class CircuitModel(nn.Module):
 
         self._replace_target_layers()
         self._handle_model_freezing()
+        
+        # Additionally, if subnet transfer is set, initialize it
+        if self.config.mask_hparams["ablation"] == "subnet_transfer":
+            self.init_subnet_transfer()
 
     def _handle_model_freezing(self):
         # Put all mask parameters in train mode, put all others in eval mode
@@ -113,6 +117,14 @@ class CircuitModel(nn.Module):
         else:
             for layer in self.root_model.modules():
                 layer.train(train_bool)
+                
+    def init_subnet_transfer(self):
+        # Initialize subnet transfer for all mask layers
+        for layer in self.root_model.modules():
+            if issubclass(type(layer), MaskLayer):
+                # Set ablation mode to subnet transfer if not yet set
+                layer.ablation = "subnet_transfer"
+                layer._init_subnet_transfer()
 
     def compute_l0_statistics(self):
         # Compute overall l0, max masking parameters, per-layer-l0 statistics

@@ -171,6 +171,8 @@ class ContSparseLayer(MaskLayer):
         hard_mask = not self.training or mask_param.requires_grad == False
         if (self.ablation == "none") and hard_mask:
             mask = (mask_param > 0).float()  # Hard Mask when not training
+        elif self.ablation == "subnet_transfer":
+            mask = (mask_param > 0).float()  # Hard Mask when in subnet transfer mode
         elif self.ablation == "complement_sampled":
             mask = self._sample_mask_from_complement(
                 param_type
@@ -294,6 +296,26 @@ class ContSparseLinear(ContSparseLayer):
         if self.mask_bias:
             self.bias_mask_params = nn.Parameter(torch.zeros(self.bias.shape))
             nn.init.constant_(self.bias_mask_params, self.mask_init_value)
+    
+    def _init_subnet_transfer(self):
+        # Register current weight & bias in buffer
+        self.register_parameter("weight_subnet", nn.Parameter(self.weight.clone().detach()))
+        self.weight_subnet.requires_grad = False
+        
+        self.register_parameter("bias_subnet", nn.Parameter(self.bias.clone().detach()))
+        self.bias_subnet.requires_grad = False
+
+        self.weight_mask_params.requires_grad = False
+        if self.mask_bias:
+            self.bias_mask_params.requires_grad = False
+        
+        # Re-init weight and bias
+        init.kaiming_uniform_(
+            self.weight, a=math.sqrt(5)
+        )  # Update Linear reset to match torch 1.12 https://pytorch.org/docs/stable/_modules/torch/nn/modules/linear.html#Linear
+        
+        # TODO: Assuming mask no longer has to be trained, might as well delete continuous mask        
+        # TODO: Support trainable subnet & potentially gradual unfreezing
 
     def reset_parameters(self):
         """Reset network parameters."""
@@ -345,6 +367,9 @@ class ContSparseLinear(ContSparseLayer):
             masked_weight = self.weight
         elif self.ablation == "random_ablate":
             masked_weight = self._compute_random_ablation("weight")
+        elif self.ablation == "subnet_transfer":
+            # Weight is composed of the frozen part in subnet and the trainable part
+            masked_weight = self.weight_subnet * self.weight_mask + self.weight * (1 - self.weight_mask)
         else:
             masked_weight = self.weight * self.weight_mask
 
@@ -354,6 +379,8 @@ class ContSparseLinear(ContSparseLayer):
                 masked_bias = self.bias
             elif self.ablation == "random_ablate":
                 masked_bias = self._compute_random_ablation("bias")
+            elif self.ablation == "subnet_transfer":
+                masked_bias = self.bias_subnet * self.bias_mask + self.bias * (1 - self.bias_mask)
             else:
                 masked_bias = self.bias * self.bias_mask
         else:
@@ -422,6 +449,25 @@ class ContSparseGPTConv1D(ContSparseLayer):
         if self.mask_bias:
             self.bias_mask_params = nn.Parameter(torch.zeros(self.bias.shape))
             nn.init.constant_(self.bias_mask_params, self.mask_init_value)
+            
+    def _init_subnet_transfer(self):
+        # Register current weight & bias in buffer
+        self.register_parameter("weight_subnet", nn.Parameter(self.weight.clone().detach()))
+        self.weight_subnet.requires_grad = False
+        
+        if self.mask_bias:
+            self.register_parameter("bias_subnet", nn.Parameter(self.bias.clone().detach()))
+            self.bias_subnet.requires_grad = False
+        
+        self.weight_mask_params.requires_grad = False
+        if self.mask_bias:
+            self.bias_mask_params.requires_grad = False
+        
+        # Re-init module weight using original init strategy
+        nn.init.normal_(self.weight, std= 0.02)
+        
+        # TODO: Assuming mask no longer has to be trained, might as well delete continuous mask        
+        # TODO: Support trainable subnet & potentially gradual unfreezing
 
     def _generate_random_values(self, param_type):
         if hasattr(self, "random_" + param_type):
@@ -458,6 +504,8 @@ class ContSparseGPTConv1D(ContSparseLayer):
             masked_weight = self.weight
         elif self.ablation == "random_ablate":
             masked_weight = self._compute_random_ablation("weight")
+        elif self.ablation == "subnet_transfer":
+            masked_weight = self.weight_subnet * self.weight_mask + self.weight * (1 - self.weight_mask)
         else:
             masked_weight = self.weight * self.weight_mask
 
@@ -467,6 +515,8 @@ class ContSparseGPTConv1D(ContSparseLayer):
                 masked_bias = self.bias
             elif self.ablation == "random_ablate":
                 masked_bias = self._compute_random_ablation("bias")
+            elif self.ablation == "subnet_transfer":
+                masked_bias = self.bias_subnet * self.bias_mask + self.bias * (1 - self.bias_mask)
             else:
                 masked_bias = self.bias * self.bias_mask
         else:
@@ -523,6 +573,36 @@ class _ContSparseConv(ContSparseLayer):
         self._base_layer.reset_parameters()
         self.weight = self._base_layer.weight
         self.bias = self._base_layer.bias
+        
+    def _init_subnet_transfer(self):
+        # Register current weight & bias in buffer
+        self.register_parameter("weight_subnet", nn.Parameter(self.weight.clone().detach()))
+        self.weight_subnet.requires_grad = False
+        
+        if hasattr(self, "bias"):
+            if self.bias is not None:
+                self.register_parameter("bias_subnet", nn.Parameter(self.bias.clone().detach()))
+                self.bias_subnet.requires_grad = False
+        
+        self.weight_mask_params.requires_grad = False
+        if self.mask_bias:
+            self.bias_mask_params.requires_grad = False
+        
+        # Re-init weight and bias
+        n = self._base_layer.in_channels
+        for k in self._base_layer.kernel_size:
+            n *= k
+        stdv = 1.0 / math.sqrt(n)
+        init.kaiming_normal_(self.weight, a=math.sqrt(5))
+        if self.bias is not None:
+            fan_in, _ = init._calculate_fan_in_and_fan_out(self.weight)
+            if fan_in != 0:
+                bound = 1 / math.sqrt(fan_in)
+                init.uniform_(self.bias, -bound, bound)
+        # #self.weight.data.uniform_(-stdv, stdv)
+        
+        # TODO: Assuming mask no longer has to be trained, might as well delete continuous mask        
+        # TODO: Support trainable subnet & potentially gradual unfreezing
 
     def _init_mask(self):
         if self.mask_unit == "weight":
@@ -569,6 +649,8 @@ class _ContSparseConv(ContSparseLayer):
             masked_weight = self.weight
         elif self.ablation == "random_ablate":
             masked_weight = self._compute_random_ablation("weight")
+        elif self.ablation == "subnet_transfer":
+            masked_weight = self.weight_subnet * self.weight_mask + self.weight * (1 - self.weight_mask)
         else:
             masked_weight = self.weight * self.weight_mask
 
@@ -576,6 +658,8 @@ class _ContSparseConv(ContSparseLayer):
             self.bias_mask = self._compute_mask("bias_mask_params")
             if not self.use_masks:
                 masked_bias = self.bias
+            elif self.ablation == "subnet_transfer":
+                masked_bias = self.bias_subnet * self.bias_mask + self.bias * (1 - self.bias_mask)
             elif self.ablation == "random_ablate":
                 masked_bias = self._compute_random_ablation("bias")
             else:

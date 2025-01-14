@@ -25,9 +25,10 @@ class MaskLayer(nn.Module):
             "zero_ablate",
             "random_ablate",
             "complement_sampled",
+            "subnet_transfer"
         ]:
             raise ValueError(
-                "Only none, randomly_sampled, zero_ablate, random_ablate, and complement_sampled are supported"
+                "Only none, randomly_sampled, zero_ablate, random_ablate, subnet_transfer, and complement_sampled are supported"
             )
         self._ablation = value
 
@@ -77,6 +78,10 @@ class MaskLayer(nn.Module):
     @abstractmethod
     def _init_mask(self):
         pass
+    
+    @abstractmethod
+    def _init_subnet_transfer(self):
+        raise NotImplementedError("Subnet transfer not implemented for this layer")
 
     @abstractmethod
     def reset_parameters(self):
