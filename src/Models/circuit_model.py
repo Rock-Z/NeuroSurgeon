@@ -6,6 +6,7 @@ from .model_configs import CircuitConfig
 from ..Masking.contsparse_layer import (
     ContSparseLayer,
     ContSparseLinear,
+    ContSparseMultiheadAttention,
     ContSparseConv1d,
     ContSparseConv2d,
     ContSparseGPTConv1D,
@@ -82,6 +83,7 @@ class CircuitModel(nn.Module):
         if config.mask_method == "continuous_sparsification":
             return {
                 nn.Linear: ContSparseLinear,
+                nn.MultiheadAttention: ContSparseMultiheadAttention,
                 nn.Conv2d: ContSparseConv2d,
                 nn.Conv1d: ContSparseConv1d,
                 GPTConv1D: ContSparseGPTConv1D,

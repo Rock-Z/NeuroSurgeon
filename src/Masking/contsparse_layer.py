@@ -390,6 +390,228 @@ class ContSparseLinear(ContSparseLayer):
         return out
 
 
+class ContSparseMultiheadAttention(ContSparseLayer):
+    def __init__(
+        self,
+        embed_dim: int,
+        num_heads: int,
+        dropout: float = 0.0,
+        bias: bool = True,
+        add_bias_kv: bool = False,
+        add_zero_attn: bool = False,
+        kdim=None,
+        vdim=None,
+        batch_first: bool = False,
+        ablation: str = "none",
+        mask_unit: str = "weight",
+        mask_bias: bool = False,
+        mask_init_value: float = 0.0,
+    ):
+        super().__init__(ablation, mask_unit, mask_bias, mask_init_value)
+
+        self.embed_dim = embed_dim
+        self.kdim = kdim if kdim is not None else embed_dim
+        self.vdim = vdim if vdim is not None else embed_dim
+        self._qkv_same_embed_dim = self.kdim == embed_dim and self.vdim == embed_dim
+        if not self._qkv_same_embed_dim:
+            raise NotImplementedError(
+                "ContSparseMultiheadAttention currently supports packed QKV weights only"
+            )
+
+        self.num_heads = num_heads
+        self.dropout = dropout
+        self.batch_first = batch_first
+        self.head_dim = embed_dim // num_heads
+        if self.head_dim * num_heads != embed_dim:
+            raise ValueError("embed_dim must be divisible by num_heads")
+
+        self.weight = nn.Parameter(torch.empty(3 * embed_dim, embed_dim))
+        if bias:
+            self.bias = nn.Parameter(torch.empty(3 * embed_dim))
+        else:
+            if self.mask_bias:
+                raise ValueError("Cannot mask bias if there is no bias")
+            self.register_parameter("bias", None)
+
+        self.out_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
+        if add_bias_kv:
+            self.bias_k = nn.Parameter(torch.empty(1, 1, embed_dim))
+            self.bias_v = nn.Parameter(torch.empty(1, 1, embed_dim))
+        else:
+            self.register_parameter("bias_k", None)
+            self.register_parameter("bias_v", None)
+        self.add_zero_attn = add_zero_attn
+
+        self.reset_parameters()
+
+    @property
+    def in_proj_weight(self):
+        return self.weight
+
+    @property
+    def in_proj_bias(self):
+        return self.bias
+
+    @classmethod
+    def from_layer(
+        self, layer: nn.MultiheadAttention, ablation, mask_unit, mask_bias, mask_init_value
+    ):
+        if not layer._qkv_same_embed_dim:
+            raise NotImplementedError(
+                "ContSparseMultiheadAttention currently supports packed QKV weights only"
+            )
+
+        bias = layer.in_proj_bias is not None
+        if not bias and mask_bias:
+            mask_bias = False
+            warnings.warn(
+                f"Cannot mask bias for layer {layer} because {layer} has no bias term"
+            )
+
+        cont_sparse = ContSparseMultiheadAttention(
+            layer.embed_dim,
+            layer.num_heads,
+            dropout=layer.dropout,
+            bias=bias,
+            add_bias_kv=layer.bias_k is not None,
+            add_zero_attn=layer.add_zero_attn,
+            kdim=layer.kdim,
+            vdim=layer.vdim,
+            batch_first=layer.batch_first,
+            ablation=ablation,
+            mask_unit=mask_unit,
+            mask_bias=mask_bias,
+            mask_init_value=mask_init_value,
+        )
+        cont_sparse.weight = layer.in_proj_weight
+        if bias:
+            cont_sparse.bias = layer.in_proj_bias
+        cont_sparse.out_proj = layer.out_proj
+        cont_sparse.bias_k = layer.bias_k
+        cont_sparse.bias_v = layer.bias_v
+
+        return cont_sparse
+
+    def _init_mask(self):
+        if self.mask_unit == "weight":
+            self.weight_mask_params = nn.Parameter(torch.zeros(self.weight.shape))
+        if self.mask_unit == "neuron":
+            self.weight_mask_params = nn.Parameter(torch.zeros(self.weight.shape[0], 1))
+
+        nn.init.constant_(self.weight_mask_params, self.mask_init_value)
+
+        if self.mask_bias:
+            self.bias_mask_params = nn.Parameter(torch.zeros(self.bias.shape))
+            nn.init.constant_(self.bias_mask_params, self.mask_init_value)
+
+    def _init_subnet_transfer(self):
+        self.register_parameter("weight_subnet", nn.Parameter(self.weight.clone().detach()))
+        self.weight_subnet.requires_grad = False
+
+        if self.mask_bias:
+            self.register_parameter("bias_subnet", nn.Parameter(self.bias.clone().detach()))
+            self.bias_subnet.requires_grad = False
+            self.bias_mask_params.requires_grad = False
+
+        self.weight_mask_params.requires_grad = False
+        init.xavier_uniform_(self.weight)
+        if self.bias is not None:
+            init.constant_(self.bias, 0.0)
+
+    def reset_parameters(self):
+        self._init_mask()
+        init.xavier_uniform_(self.weight)
+        if self.bias is not None:
+            init.constant_(self.bias, 0.0)
+            init.constant_(self.out_proj.bias, 0.0)
+        if self.bias_k is not None:
+            init.xavier_normal_(self.bias_k)
+        if self.bias_v is not None:
+            init.xavier_normal_(self.bias_v)
+
+    def _generate_random_values(self, param_type):
+        if hasattr(self, "random_" + param_type):
+            return getattr(self, "random_" + param_type)
+
+        if param_type == "weight":
+            self.random_weight = nn.Parameter(torch.empty(self.weight.shape))
+            init.xavier_uniform_(self.random_weight)
+            self.random_weight.requires_grad = False
+            return self.random_weight
+
+        if param_type == "bias":
+            self.random_bias = nn.Parameter(torch.zeros(self.bias.shape))
+            self.random_bias.requires_grad = False
+            return self.random_bias
+
+        raise ValueError("generate_random_values only supports weights and biases")
+
+    def _masked_weight(self):
+        self.weight_mask = self._compute_mask("weight_mask_params")
+
+        if not self.use_masks:
+            return self.weight
+        if self.ablation == "random_ablate":
+            return self._compute_random_ablation("weight")
+        if self.ablation == "subnet_transfer":
+            return self.weight_subnet * self.weight_mask + self.weight * (1 - self.weight_mask)
+        return self.weight * self.weight_mask
+
+    def _masked_bias(self):
+        if not self.mask_bias:
+            return self.bias
+
+        self.bias_mask = self._compute_mask("bias_mask_params")
+        if not self.use_masks:
+            return self.bias
+        if self.ablation == "random_ablate":
+            return self._compute_random_ablation("bias")
+        if self.ablation == "subnet_transfer":
+            return self.bias_subnet * self.bias_mask + self.bias * (1 - self.bias_mask)
+        return self.bias * self.bias_mask
+
+    def forward(
+        self,
+        query,
+        key,
+        value,
+        key_padding_mask=None,
+        need_weights=True,
+        attn_mask=None,
+        average_attn_weights=True,
+        is_causal=False,
+    ):
+        is_batched = query.dim() == 3
+        if self.batch_first and is_batched:
+            query, key, value = (x.transpose(1, 0) for x in (query, key, value))
+
+        attn_output, attn_output_weights = F.multi_head_attention_forward(
+            query,
+            key,
+            value,
+            self.embed_dim,
+            self.num_heads,
+            self._masked_weight(),
+            self._masked_bias(),
+            self.bias_k,
+            self.bias_v,
+            self.add_zero_attn,
+            self.dropout,
+            self.out_proj.weight,
+            self.out_proj.bias,
+            training=self.training,
+            key_padding_mask=key_padding_mask,
+            need_weights=need_weights,
+            attn_mask=attn_mask,
+            use_separate_proj_weight=False,
+            average_attn_weights=average_attn_weights,
+            is_causal=is_causal,
+        )
+        if self.batch_first and is_batched:
+            attn_output = attn_output.transpose(1, 0)
+        return attn_output, attn_output_weights
+
+
 class ContSparseGPTConv1D(ContSparseLayer):
     """For some reason, GPT uses a custom Conv1D layer instead of a linear layer
 
